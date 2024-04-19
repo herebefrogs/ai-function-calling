@@ -4,8 +4,8 @@ Leverage dynamic data from 3rd party APIs in your AI model answers.
 
 Requirements:
 - an [OpenAI API account](https://platform.openai.com/account/organization) & API key,
-- or a [RunPod.io API account](https://www.runpod.io/console/signup) & API key,
-- or any computer vision model, like LLaVa and BakLLaVa, running locally via [Ollama](https://ollama.ai).
+- or the OpenHermes model running locally via [Ollama](https://ollama.ai),
+
 
 ## Getting started
 
