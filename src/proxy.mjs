@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import express from "express";
+import { Ajv } from "ajv";
 import { default as API_KEYS } from "../api-keys.json" with { type: "json" };
 
 const openai = new OpenAI({ apiKey: API_KEYS.OPENAI });
@@ -55,11 +56,62 @@ const formatHermes2Functions = () => Object.entries(FUNCTION_CALLS).map(([name, 
 
 const sanitizeToolcall = match => console.debug({tool_call: match[1]}) || JSON.parse(match[1].replace(/\n/, "").trim().replace(/'/g, "\"").replace(/arguments/, "properties"));
 
+const callOllama = async (model, messages, abortAfter = 5) => {
+  if (abortAfter <= 0) {
+    // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
+    return messages;
+  }
+
+  // call AI model with user prompt and previous messages
+  let response = await OLLAMA.chat({ model, messages });
+console.debug('assistant response', response);
+
+  // log response
+  messages.push({ role: "assistant", content: response });
+
+  try {
+    // check if response requests some function call(s)
+    const toolCalls = [...response.matchAll(/<tool_call>\n(.*?)\n<\/tool_call>/gs)].map(sanitizeToolcall);
+  
+    if (toolCalls.length) {
+      while (toolCalls.length) {
+        const { name, properties } = toolCalls.shift();
+
+        const callFunction = FUNCTION_CALLS[name];
+
+        if (!callFunction) {
+          // log error for the model to consider
+          messages.push({ role: "user", content: JSON.stringify({ error: { type: "function check", message: `Function ${name} not found` } }) });
+          continue;
+        }
+
+        if (!callFunction.validate(properties)) {
+          // log error for the model to consider
+          messages.push({ role: "user", content: JSON.stringify({ error: { type: "arguments check", message: callFunction.validate.errors } }) });
+          continue;
+        }
+        // execute function call
+// TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
+        response = await callFunction.callback.apply(null, Object.values(properties));
+  
+        // log response
+        messages.push({ role: "user", content: JSON.stringify(response) });
+      }
+  
+      // call AI model again with function call responses
+      messages = await callOllama(model, messages, abortAfter - 1);
+    }
+  } catch (e) {
+    // log error for the model to consider
+    messages.push({ role: "user", content: JSON.stringify({ error: { type: e.name, message: e.message } }) });
+  }
+
+  // no more function call(s) needed, return the whole conversation with the assistant's final answer
+  return messages;
+}
+
 
 // 3rd party APIs function calls
-
-  // TODO build a better function calling format and prompt chatML, and implement function calling validation
-  // to ensure the function can be called and the parameters are correctly formatted
 
 const FUNCTION_CALLS = {
   // Open-Notify: ISS location and people in space
@@ -90,58 +142,25 @@ const FUNCTION_CALLS = {
       },
       required: ['lat', 'long']
     }
+  },
+  // Tomorrow.io: Realtime weather data
+  getWeatherByCoordinates: {
+    callback: async (lat, long) => await request(`https://api.tomorrow.io/v4/weather/realtime?location=${lat},${long}&units=metric&apikey=${API_KEYS.TOMORROW_IO}`),
+    schema: {
+      description: "Get the temperature and weather code by latitude and longitude coordinates",
+      properties: {
+        lat: { type: 'number' },
+        long: { type: 'number' }
+      },
+      required: ['lat', 'long']
+    }
   }
 };
 
-const callOllama = async (model, messages, abortAfter = 10) => {
-  if (abortAfter <= 0) {
-    // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
-    return messages;
-  }
+// precompile a schema validator for each public API function call
+const jsonValidator = new Ajv();
+Object.values(FUNCTION_CALLS).forEach(func => func.validate = jsonValidator.compile(func.schema));
 
-  // call AI model with user prompt and previous messages
-  let response = await OLLAMA.chat({ model, messages });
-console.debug('assistant response', response);
-
-  // log response
-  messages.push({ role: "assistant", content: response });
-
-  try {
-    // check if response requests some function call(s)
-    const toolCalls = [...response.matchAll(/<tool_call>\n(.*?)\n<\/tool_call>/gs)].map(sanitizeToolcall);
-  
-    if (toolCalls.length) {
-      while (toolCalls.length) {
-        const { name, properties } = toolCalls.shift();
-        // TODO handle properties validation
-  
-  console.debug('func call', name, properties, FUNCTION_CALLS[name]);
-
-        if (!FUNCTION_CALLS[name]) {
-          // log error for the model to consider
-          messages.push({ role: "user", content: JSON.stringify({ error: { type: "safety check", message: `Function ${name} not found` } }) });
-          continue;
-        }
-
-        // execute function call
-// TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
-        response = await FUNCTION_CALLS[name].callback.apply(null, Object.values(properties));
-  
-        // log response
-        messages.push({ role: "user", content: JSON.stringify(response) });
-      }
-  
-      // call AI model again with function call responses
-      messages = await callOllama(model, messages, abortAfter - 1);
-    }
-  } catch (e) {
-    // log error for the model to consider
-    messages.push({ role: "user", content: JSON.stringify({ error: { type: e.name, message: e.message } }) });
-  }
-
-  // no more function call(s) needed, return the whole conversation with the assistant's final answer
-  return messages;
-}
 
 // Proxy Endpoints
 
