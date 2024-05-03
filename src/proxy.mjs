@@ -2,8 +2,7 @@ import OpenAI from "openai";
 import express from "express";
 import { default as API_KEYS } from "../api-keys.json" with { type: "json" };
 
-
-const client = new OpenAI({ apiKey: API_KEYS.OPENAI });
+const openai = new OpenAI({ apiKey: API_KEYS.OPENAI });
 
 
 const app = express();
@@ -12,14 +11,8 @@ app.use(express.json()) // for parsing req.body when mine type is application/js
 
 // Utils
 
-const CONFIG = {
-  ollama: {
-    // endpoint: "http://localhost:11434/v1/chat/completions",
-    endpoint: "https://82ak70uolcli9q-11434.proxy.runpod.net/v1/chat/completions",
-  }
-}
-
 async function request(endpoint, method = "get", params, apiKey) {
+console.debug('request', endpoint, method, params, apiKey);
   const options = { method, headers: { "Content-Type": "application/json" }};
   if (apiKey) {
     options.headers["Authorization"] = `Bearer ${apiKey}`;
@@ -29,18 +22,38 @@ async function request(endpoint, method = "get", params, apiKey) {
   }
 
   const response = await fetch(endpoint, options);
-  return await response.json();
+  const data = await response.json();
+console.debug('response', data);
+  return data;
+}
+
+const CONFIG = {
+  OLLAMA: {
+    ENDPOINT: process.env.RUNPOD_ID ? `https://${process.env.RUNPOD_ID}-11434.proxy.runpod.net/v1/chat/completions` : "http://localhost:11434/api/generate",
+  }
 }
 
 const OLLAMA = {
   chat: async (options) => {
-    const response = await request(CONFIG.ollama.endpoint, "post", { model: "openhermes", stream: false, ...options });
-console.log('ollama response', response, response.choices[0]);
+    const response = await request(CONFIG.OLLAMA.ENDPOINT, "post", { model: "openhermes", stream: false, ...options });
     return response.choices[response.choices.length - 1].message.content;
   },
 }
 
+const formatGPT4Tools = () => Object.entries(FUNCTION_CALLS).map(([name, data]) => ({
+  type: "function",
+  function: {
+    name,
+    description: data.schema.description
+}}));
 
+const formatHermes2Functions = () => Object.entries(FUNCTION_CALLS).map(([name, data]) => JSON.stringify({
+  title: name,
+  type: 'function',
+  ...data.schema
+})).join("\n");
+
+const sanitizeToolcall = match => console.debug({tool_call: match[1]}) || JSON.parse(match[1].replace(/\n/, "").trim().replace(/'/g, "\"").replace(/arguments/, "properties"));
 
 
 // 3rd party APIs function calls
@@ -50,15 +63,85 @@ console.log('ollama response', response, response.choices[0]);
 
 const FUNCTION_CALLS = {
   // Open-Notify: ISS location and people in space
-  getISSLocation: async () => await request("http://api.open-notify.org/iss-now.json"),
-  getPeopleInSpace: async () => await request("http://api.open-notify.org/astros.json")
+  getISSLocation: {
+    callback: async () => await request("http://api.open-notify.org/iss-now.json"),
+    schema: {
+      description: "Get the current location of the International Space Station",
+      properties: {},
+      required: []
+    }
+  },
+  getPeopleInSpace: {
+    callback: async () => await request("http://api.open-notify.org/astros.json"),
+    schema: {
+      description: "Get the number and name of people currently in space",
+      properties: {},
+      required: []
+    }
+  },
+  // Nominatin API: Reverse Geocoding
+  getCityByCoordinates: {
+    callback: async (lat, long) => await request(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${long}&format=json&zoom=10`),
+    schema: {
+      description: "Get the city, county, state and country by latitude and longitude coordinates",
+      properties: {
+        lat: { type: 'number' },
+        long: { type: 'number' }
+      },
+      required: ['lat', 'long']
+    }
+  }
 };
 
-// // TODO ollama only
-// function parseFunctionCall(call) {
-//   const [name, params] = call.split("(");
-//   return { name, params: params.replace(")", "").split(",") };
-// }
+const callOllama = async (model, messages, abortAfter = 10) => {
+  if (abortAfter <= 0) {
+    // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
+    return messages;
+  }
+
+  // call AI model with user prompt and previous messages
+  let response = await OLLAMA.chat({ model, messages });
+console.debug('assistant response', response);
+
+  // log response
+  messages.push({ role: "assistant", content: response });
+
+  try {
+    // check if response requests some function call(s)
+    const toolCalls = [...response.matchAll(/<tool_call>\n(.*?)\n<\/tool_call>/gs)].map(sanitizeToolcall);
+  
+    if (toolCalls.length) {
+      while (toolCalls.length) {
+        const { name, properties } = toolCalls.shift();
+        // TODO handle properties validation
+  
+  console.debug('func call', name, properties, FUNCTION_CALLS[name]);
+
+        if (!FUNCTION_CALLS[name]) {
+          // log error for the model to consider
+          messages.push({ role: "user", content: JSON.stringify({ error: { type: "safety check", message: `Function ${name} not found` } }) });
+          continue;
+        }
+
+        // execute function call
+// TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
+        response = await FUNCTION_CALLS[name].callback.apply(null, Object.values(properties));
+  
+        // log response
+        messages.push({ role: "user", content: JSON.stringify(response) });
+      }
+  
+      // call AI model again with function call responses
+      messages = await callOllama(model, messages, abortAfter - 1);
+    }
+  } catch (e) {
+    // log error for the model to consider
+    messages.push({ role: "user", content: JSON.stringify({ error: { type: e.name, message: e.message } }) });
+  }
+
+  // no more function call(s) needed, return the whole conversation with the assistant's final answer
+  return messages;
+}
 
 // Proxy Endpoints
 
@@ -66,25 +149,12 @@ app.post("/function/call", async (req, res) => {
   const { model, prompt } = req.body;
 
   let messages = [];
+  let error;
+  let response;
  
   switch(model) {
     case "gpt4":
-      const tools = [
-        {
-          type: "function",
-          function: {
-            name: "getPeopleInSpace",
-            description: "Get the number and name of people currently in space",
-          }
-        },
-        {
-          type: "function",
-          function: {
-            name: "getISSLocation",
-            description: "Get the current location of the International Space Station",
-          }    
-        }
-      ];
+      // TODO rewrite this in the model of callOllama
       messages.push({
         role: "system",
         content: "You are a assistant helping users to get an answer to their query. You do not guess, and call functions to get the information you need to answer the query."
@@ -93,7 +163,7 @@ app.post("/function/call", async (req, res) => {
         content: prompt
       })
 
-      let response = await client.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools });
+      response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools: formatGPT4Tools() });
       messages.push(response.choices[0].message);
 
       if (response.choices[0].finish_reason === "tool_calls") {
@@ -110,79 +180,38 @@ app.post("/function/call", async (req, res) => {
             res.json({ error: `Function ${name}(${toolCall.function.arguments}) not found` });
             return;
           }
-          const data = await callFunction.apply();
+          const data = await callFunction.apply(null );
           messages.push({ tool_call_id: toolCall.id, role: "tool", name, content: JSON.stringify(data) });
 
-          response = await client.chat.completions.create({ model: "gpt-4-turbo-preview", messages });
+          response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages });
           messages.push(response.choices[0].message);
           // TODO if this new response also has a tool call, append it to toolCalls.
         }
       }
-
-      res.json({ messages });
       break;
-    case "openhermes":
-      // TODO clean that up later
-      messages.push({
+  case "noushermes2promistral":
+  case "mistral:7b-instruct":
+    messages = await callOllama(model, [
+      {
         role: "system",
-        content: "You are a helpfull assistant who does not guess when answering a user's queries. \
-  Do not describe how a user can get the answer, just provide the answer. \
-  If the information you need is in the history of your conversation with the user, leverage it in your answer. \
-  If not, you can call some of the following Javascript functions to obtain that information by returning only: \
-  Call: <name of the function to call>(<function parameters if any>) \
-  \
-  Functions:\
-  /**\
-   * Return the number and name of people currently in space\
-   * Args: none\
-   * Returns { number: int, people: [ { name: string, craft: string } ] }\
-   */\
-  function getPeopleInSpace()\
-  \
-  /**\
-   * Return the current location of the International Space Station\
-   * Args: none\
-   * Returns { timestamp: int, iss_position: { latitude: float, longitude: float } }\
-   */\
-  function getISSLocation()"
+// TODO instruct the model to break down reasoning into separate function calls, one at a time. When one function call's arguments depend on the result from a previous call, there is no point
+// in requesting the second call with dynamic argument placeholders. The model should be instructed to make the second call after the first call has been resolved.
+        content: `You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. \
+Always make one function call at the time, and don't make assumptions about what values to plug into functions. Use the JSON schema specification for each tool call you will make: \
+{'title': 'arguments', 'type': 'object', 'properties': {'options': {'title': 'Options', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['options', 'name']}
+Here are the available tools:\n\
+<tools>\n${formatHermes2Functions()}\n</tools>\n\
+For each function call return a JSON object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n \
+<tool_call>\n \
+{"name": "FUNCTION_NAME", "arguments": "ARGS_DICT" }\n \
+</tool_call>\n`
       },
       { role: "user", content: prompt }
-    );
+    ]);
+    break;  
+  }
 
-      let answer = await OLLAMA.chat({ messages });
-      
-    console.log('initial answer', { answer })
-      if (answer.startsWith("Call:")) {
-    console.log('function calling request detected');
-    
-        const callRequest = answer.split(":")[1].trim();
-        const { name, params } = parseFunctionCall(callRequest);
-        const callFunction = FUNCTION_CALLS[name];
-    
-    console.log('function calling details', name, params, callFunction);
-    
-        // NOTE: eval() is risky if poorly formatted arguments or function halucinated
-        // const data = await eval(callRequest);
-        
-        if (!callFunction) {
-          res.json({ error: `Function ${name}(${params.join(", ")}) not found` });
-          return;
-        }
-        
-        const data = await callFunction.apply(params);
-    
-    console.log('function calling returned', data)
-    // TODO wait, I don't do anything with data, I should add it to the messages
-        messages.push({ role: "assistant", content: callRequest });
-        messages.push({ role: "user", content: query });
-    
-    console.log('messages', messages);
-    
-        answer = await OLLAMA.chat({ messages });
-      }
-    
-      res.json({ answer })
-    }
-  });
+  res.json({ error, messages });
+});
 
-app.listen(8000, () => console.log("Server running on http://localhost:8000\nHave you updated the RunPod proxy URL in the CONFIG object?"));
+app.listen(8000, () => console.log(`\nServer running on http://localhost:8000\n\nOLLAMA endpoint: ${CONFIG.OLLAMA.ENDPOINT}`));

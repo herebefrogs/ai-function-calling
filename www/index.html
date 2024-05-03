@@ -56,7 +56,7 @@
   </head>
   <body>
     <header>
-      <h1>Function Calling</h1>
+      <!-- <h1>Function Calling</h1> -->
     </header>
     <section class="container">
       <table id="chat">
@@ -72,10 +72,12 @@
         <textarea id="query" type="text" cols="75" rows="1"></textarea>
       </p>
       <p class="models">Model:
-        <input type="radio" id="gpt4" name="model" value="gpt4" checked />
+        <input type="radio" id="gpt4" name="model" value="gpt4" />
         <label for="gpt4">GPT-4</label>
-        <input type="radio" id="openhermes" name="model" value="openhermes" />
-        <label for="openhermes">Open Hermes</label>
+        <input type="radio" id="noushermes" name="model" value="noushermes2promistral" />
+        <label for="noushermes">Nous Hermes 2 Pro Mistral</label>
+        <input type="radio" id="mistralinstruct" name="model" value="mistral:7b-instruct" checked />
+        <label for="mistralinstruct">Mistral Instruct</label>
       </p>
       <p class="controls">
         Reset <button id="reset">
@@ -143,6 +145,7 @@
           appendError(error);
         } else {
           messages.forEach(appendMessage);
+          spin.style.display = "none";
         }
       }
 
