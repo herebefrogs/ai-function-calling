@@ -56,6 +56,67 @@ const formatHermes2Functions = () => Object.entries(FUNCTION_CALLS).map(([name, 
 
 const sanitizeToolcall = match => console.debug({tool_call: match[1]}) || JSON.parse(match[1].replace(/\n/, "").trim().replace(/'/g, "\"").replace(/arguments/, "properties"));
 
+
+const callOpenAI = async (messages, abortAfter = 10) => {
+  if (abortAfter <= 0) {
+    // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
+    return messages;
+  }
+
+  let response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools: formatGPT4Tools() });
+console.debug('assistant response', response.choices[0].message);
+
+  messages.push(response.choices[0].message);
+
+  const toolCalls = [];
+
+  if (response.choices[0].finish_reason === "tool_calls") {
+    toolCalls.push(...response.choices[0].message.tool_calls);
+
+    try {
+      while (toolCalls.length) {
+        const toolCall = toolCalls.shift();
+console.debug('tool call', toolCall);
+        const tool_call_id = toolCall.id;
+        const name = toolCall.function.name;
+  
+        const properties = JSON.parse(toolCall.function.arguments);
+  // TODO this is common with callOllama
+        const callFunction = FUNCTION_CALLS[name];
+  
+        if (!callFunction) {
+          // log error for the model to consider
+          messages.push({ tool_call_id, role: "tool", content: JSON.stringify({ error: { type: "function check", message: `Function ${name} not found` } }) });
+          continue;
+        }
+  
+        if (!callFunction.validate(properties)) {
+          // log error for the model to consider
+          messages.push({ tool_call_id, role: "tool", content: JSON.stringify({ error: { type: "arguments check", message: callFunction.validate.errors } }) });
+          continue;
+        }
+  
+        // execute function call
+  // TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
+        response = await callFunction.callback.apply(null, Object.values(properties));
+  // END this is common with callOllama
+  
+        // log response
+        messages.push({ tool_call_id, role: "tool", name, content: JSON.stringify(response) });
+      }
+    } catch (e) {
+      // log error for the model to consider
+      messages.push({ role: "user", content: JSON.stringify({ error: { type: e.name, message: e.message } }) });
+    }
+
+    // call AI model again with function call responses
+    messages = callOpenAI(messages, abortAfter - 1);
+  }
+
+  // no more function call(s) needed, return the whole conversation with the assistant's final answer
+  return messages;
+}
+
 const callOllama = async (model, messages, abortAfter = 5) => {
   if (abortAfter <= 0) {
     // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
@@ -168,45 +229,13 @@ app.post("/function/call", async (req, res) => {
   const { model, prompt } = req.body;
 
   let messages = [];
-  let error;
-  let response;
  
   switch(model) {
     case "gpt4":
-      // TODO rewrite this in the model of callOllama
-      messages.push({
-        role: "system",
-        content: "You are a assistant helping users to get an answer to their query. You do not guess, and call functions to get the information you need to answer the query."
-      }, {
-        role: "user",
-        content: prompt
-      })
-
-      response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools: formatGPT4Tools() });
-      messages.push(response.choices[0].message);
-
-      if (response.choices[0].finish_reason === "tool_calls") {
-        const toolCalls = [...response.choices[0].message.tool_calls];
-
-        while (toolCalls.length) {
-          const toolCall = toolCalls.shift();
-          const name = toolCall.function.name;
-          // TODO handle arguments
-          //const params = JSON.parse(toolCall.function.arguments)
-          const callFunction = FUNCTION_CALLS[name];
-          // TODO handle errors
-          if (!callFunction) {
-            res.json({ error: `Function ${name}(${toolCall.function.arguments}) not found` });
-            return;
-          }
-          const data = await callFunction.apply(null );
-          messages.push({ tool_call_id: toolCall.id, role: "tool", name, content: JSON.stringify(data) });
-
-          response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages });
-          messages.push(response.choices[0].message);
-          // TODO if this new response also has a tool call, append it to toolCalls.
-        }
-      }
+      messages = await callOpenAI([
+        { role: "system", content: "You are a function calling AI model. You may make one or more function calls to assist users with their query. Don't make assumptions about what values to plug into functions." },
+        { role: "user", content: prompt }
+      ])
       break;
   case "noushermes2promistral":
   case "mistral:7b-instruct":
@@ -230,7 +259,7 @@ For each function call return a JSON object with function name and arguments wit
     break;  
   }
 
-  res.json({ error, messages });
+  res.json({ messages });
 });
 
 app.listen(8000, () => console.log(`\nServer running on http://localhost:8000\n\nOLLAMA endpoint: ${CONFIG.OLLAMA.ENDPOINT}`));
