@@ -2,18 +2,80 @@ import OpenAI from "openai";
 import express from "express";
 import { Ajv } from "ajv";
 import { default as API_KEYS } from "../api-keys.json" with { type: "json" };
-
-const openai = new OpenAI({ apiKey: API_KEYS.OPENAI });
-
+import { ValidationError } from "./errors.mjs";
 
 const app = express();
 app.use(express.static("www"));
 app.use(express.json()) // for parsing req.body when mine type is application/json
 
+
+// AI clients
+
+const openai = new OpenAI({ apiKey: API_KEYS.OPENAI });
+
+const CONFIG = {
+  OLLAMA: {
+    ENDPOINT: process.env.RUNPOD_ID ? `https://${process.env.RUNPOD_ID}-11434.proxy.runpod.net` : "http://localhost:11434",
+  }
+}
+
+const OLLAMA = {
+  // options must contain at least model and messages
+  chat: async (options) => {
+    const response = await request(CONFIG.OLLAMA.ENDPOINT + "/v1/chat/completions", "post", { stream: false, ...options });
+    return response.choices[response.choices.length - 1].message.content;
+  },
+  // options must contain at least model and prompt
+  generate: async (options) => {
+    const response = await request(CONFIG.OLLAMA.ENDPOINT + "/api/generate", "post", { stream: false, ...options });
+    return response.response;
+  }
+}
+
+// 3rd party APIs function calls
+
+const FUNCTION_CALLS = {
+  // Open-Notify: ISS location and people in space
+  getISSLocation: {
+    callback: async () => await request("http://api.open-notify.org/iss-now.json"),
+    description: "getISSLocation() -> dict - Get the current location of the International Space Station\n\n   Args:\n   None\n\n   Returns:\n   dict: A dictionary containing the latitude and longitude of the ISS",
+    properties: {},
+    required: []
+  },
+  getPeopleInSpace: {
+    callback: async () => await request("http://api.open-notify.org/astros.json"),
+    description: "getPeopleInSpace() -> dict - Get the number and name of people currently in space\n\n   Args:\n   None\n\n   Returns:\n   dict: A dictionary containing the number of people and their names",
+    properties: {},
+    required: []
+  },
+  // Nominatin API: Reverse Geocoding
+  getCityByCoordinates: {
+    callback: async ({ latitude, longitude }) => await request(`https://nominatim.openstreetmap.org/reverse?lat=${latitude}&lon=${longitude}&format=json&zoom=10`),
+    description: "getCityByCoordinates(lat: number, long: number) -> dict - Get the city, county, state and country by latitude and longitude coordinates\n\n   Args:\n   lat (number): The latitude coordinate\n   long (number): The longitude coordinate\n\n   Returns:\n   dict: A dictionary containing the city, county, state and country",
+    properties: {
+      // accepts -15.26 or "-15.26" as valid values (unfortunately, that will also accept "<$issLocation.lat>" but this seems easier for models to recover from than a TypeError
+      latitude: { type: ['number', 'string' ] },
+      longitude: { type: ['number', 'string' ] }
+    },
+    required: ['latitude', 'longitude']
+  },
+  // Tomorrow.io: Realtime weather data
+  getWeatherByCoordinates: {
+    callback: async ({ latitude, longitude }) => await request(`https://api.tomorrow.io/v4/weather/realtime?location=${latitude},${longitude}&units=metric&apikey=${API_KEYS.TOMORROW_IO}`),
+    description: "getWeatherByCoordinates(lat: number, long: number) -> Get the temperature and weather code by latitude and longitude coordinates\n\n   Args:\n   lat (number): The latitude coordinate\n   long (number): The longitude coordinate\n\n   Returns:\n   dict: A dictionary containing the temperature and weather code",
+    properties: {
+      latitude: { type: ['number', 'string' ] },
+      longitude: { type: ['number', 'string' ] }
+    },
+    required: ['latitude', 'longitude']
+  }
+};
+
 // Utils
 
 async function request(endpoint, method = "get", params, apiKey) {
-console.debug('request', endpoint, method, params, apiKey);
+  console.debug('request', endpoint, method, params, apiKey);
+
   const options = { method, headers: { "Content-Type": "application/json" }};
   if (apiKey) {
     options.headers["Authorization"] = `Bearer ${apiKey}`;
@@ -24,37 +86,31 @@ console.debug('request', endpoint, method, params, apiKey);
 
   const response = await fetch(endpoint, options);
   const data = await response.json();
-console.debug('response', data);
+  console.debug('response', data);
+
   return data;
 }
 
-const CONFIG = {
-  OLLAMA: {
-    ENDPOINT: process.env.RUNPOD_ID ? `https://${process.env.RUNPOD_ID}-11434.proxy.runpod.net/v1/chat/completions` : "http://localhost:11434/api/generate",
-  }
-}
-
-const OLLAMA = {
-  chat: async (options) => {
-    const response = await request(CONFIG.OLLAMA.ENDPOINT, "post", { model: "openhermes", stream: false, ...options });
-    return response.choices[response.choices.length - 1].message.content;
-  },
-}
-
-const formatGPT4Tools = () => Object.entries(FUNCTION_CALLS).map(([name, data]) => ({
+const formatTools = () => Object.entries(FUNCTION_CALLS).map(([name, { description, required, properties }]) => ({
   type: "function",
   function: {
     name,
-    description: data.schema.description
-}}));
+    description,
+    parameters: {
+      type: "object",
+      properties,
+      required
+    }
+  }
+}));
 
-const formatHermes2Functions = () => Object.entries(FUNCTION_CALLS).map(([name, data]) => JSON.stringify({
-  title: name,
-  type: 'function',
-  ...data.schema
-})).join("\n");
+const formatChatML = (messages) => messages.map(({ role, content }) => `<|im_start|>${role}\n${content}<|im_end|>`).join("\n");
 
-const sanitizeToolcall = match => console.debug({tool_call: match[1]}) || JSON.parse(match[1].replace(/\n/, "").trim().replace(/'/g, "\"").replace(/arguments/, "properties"));
+const formatToolResponse = (response) => `<tool_response>${JSON.stringify(response)}</tool_response>`;
+
+const sanitizeToolcall = tool_call => console.debug({tool_call}) || JSON.parse(tool_call.replace(/\n/, "").trim().replace(/'/g, "\""));
+
+const pluckArgumentValues = (args, values) => Object.keys(args).reduce((acc, key) => { acc[key] = values[key]; return acc; }, {});
 
 
 const callOpenAI = async (messages, abortAfter = 10) => {
@@ -63,8 +119,8 @@ const callOpenAI = async (messages, abortAfter = 10) => {
     return messages;
   }
 
-  let response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools: formatGPT4Tools() });
-console.debug('assistant response', response.choices[0].message);
+  let response = await openai.chat.completions.create({ model: "gpt-4-turbo-preview", messages, tools: formatTools() });
+  console.debug('assistant response', response.choices[0].message);
 
   messages.push(response.choices[0].message);
 
@@ -74,14 +130,17 @@ console.debug('assistant response', response.choices[0].message);
     toolCalls.push(...response.choices[0].message.tool_calls);
 
     try {
+      // NOTE: GPT4 is excellent at splitting nested function calls as separate messages so it can use the values of one as arguments for the next
+      // so we can process all function calls requested in the response with reasonable confidence they won't fail
       while (toolCalls.length) {
         const toolCall = toolCalls.shift();
-console.debug('tool call', toolCall);
+        console.debug('tool call', toolCall);
+
         const tool_call_id = toolCall.id;
         const name = toolCall.function.name;
   
-        const properties = JSON.parse(toolCall.function.arguments);
-  // TODO this is common with callOllama
+        const argumentsValues = JSON.parse(toolCall.function.arguments);
+
         const callFunction = FUNCTION_CALLS[name];
   
         if (!callFunction) {
@@ -90,16 +149,14 @@ console.debug('tool call', toolCall);
           continue;
         }
   
-        if (!callFunction.validate(properties)) {
+        if (!callFunction.validate(argumentsValues)) {
           // log error for the model to consider
           messages.push({ tool_call_id, role: "tool", content: JSON.stringify({ error: { type: "arguments check", message: callFunction.validate.errors } }) });
           continue;
         }
   
         // execute function call
-  // TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
-        response = await callFunction.callback.apply(null, Object.values(properties));
-  // END this is common with callOllama
+        response = await callFunction.callback.apply(null, pluckArgumentValues(callFunction.schema.properties, argumentsValues));
   
         // log response
         messages.push({ tool_call_id, role: "tool", name, content: JSON.stringify(response) });
@@ -117,111 +174,65 @@ console.debug('tool call', toolCall);
   return messages;
 }
 
-const callOllama = async (model, messages, abortAfter = 5) => {
+
+const callOllama = async (model, messages, abortAfter = 10) => {
   if (abortAfter <= 0) {
     // if parameters aren't passed properly to external APIs, the conversation can get into an endless loop
     return messages;
   }
 
   // call AI model with user prompt and previous messages
-  let response = await OLLAMA.chat({ model, messages });
-console.debug('assistant response', response);
+  let response = await OLLAMA.generate({ model, prompt: formatChatML(messages) });
+  console.debug('assistant response', response);
 
-  // log response
-  messages.push({ role: "assistant", content: response });
+  // check if response requests some function call(s)
+  const toolCalls = [...response.matchAll(/<tool_call>\n(.*?)\n<\/tool_call>/gs)];
 
-  try {
-    // check if response requests some function call(s)
-    const toolCalls = [...response.matchAll(/<tool_call>\n(.*?)\n<\/tool_call>/gs)].map(sanitizeToolcall);
-  
-    if (toolCalls.length) {
-      while (toolCalls.length) {
-        const { name, properties } = toolCalls.shift();
+  if (!toolCalls.length) {
+    messages.push({ role: "assistant", content: response });
+  } else {
+    // NOTE: unfortunately, Hermes2 and Mistral models don't split nested function calls as separate messages, so the function calls
+    // dependent on previous ones tend to have hallucinated variables in place of values and can't be executed or even parsed.
+    // to break down the models' reasoning, only process the first function call so the other ones will be requested again later with the correct values
+    const [match, captureGroup] = toolCalls[0];
+    
+    // log first function call
+    messages.push({ role: "assistant", content: match });
+    
+    try {
+      const { name, arguments: argumentsValues } = sanitizeToolcall(captureGroup);
+      const callFunction = FUNCTION_CALLS[name];
 
-        const callFunction = FUNCTION_CALLS[name];
-
-        if (!callFunction) {
-          // log error for the model to consider
-          messages.push({ role: "user", content: JSON.stringify({ error: { type: "function check", message: `Function ${name} not found` } }) });
-          continue;
-        }
-
-        if (!callFunction.validate(properties)) {
-          // log error for the model to consider
-          messages.push({ role: "user", content: JSON.stringify({ error: { type: "arguments check", message: callFunction.validate.errors } }) });
-          continue;
-        }
-        // execute function call
-// TODO this passes arguments positionally, but the function call schema may have them in a different order. Would be best to make callbacks accept an object instead.
-        response = await callFunction.callback.apply(null, Object.values(properties));
-  
-        // log response
-        messages.push({ role: "user", content: JSON.stringify(response) });
+      // log errors for the model to consider
+      if (!callFunction) {
+        throw new SyntaxError(`Function ${name} not found`);
       }
-  
-      // call AI model again with function call responses
-      messages = await callOllama(model, messages, abortAfter - 1);
+      
+      if (!callFunction.validate(argumentsValues)) {
+        throw new ValidationError(callFunction.validate.errors);
+      }
+
+      // execute function call
+      const sanitizedArguments = pluckArgumentValues(callFunction.properties, argumentsValues);
+      console.debug({ sanitizedArguments});
+      response = await callFunction.callback(sanitizedArguments);
+
+      // log response
+      messages.push({ role: "tool", content: formatToolResponse(response) });
+    
+    } catch (e) {
+      console.error(e);
+      // log error for the model to consider
+      messages.push({ role: "tool", content: formatToolResponse({ error: { type: e.name, message: e.message } }) });
     }
-  } catch (e) {
-    // log error for the model to consider
-    messages.push({ role: "user", content: JSON.stringify({ error: { type: e.name, message: e.message } }) });
+    
+    // call AI model again with function call responses
+    messages = await callOllama(model, messages, abortAfter - 1);
   }
 
   // no more function call(s) needed, return the whole conversation with the assistant's final answer
   return messages;
 }
-
-
-// 3rd party APIs function calls
-
-const FUNCTION_CALLS = {
-  // Open-Notify: ISS location and people in space
-  getISSLocation: {
-    callback: async () => await request("http://api.open-notify.org/iss-now.json"),
-    schema: {
-      description: "Get the current location of the International Space Station",
-      properties: {},
-      required: []
-    }
-  },
-  getPeopleInSpace: {
-    callback: async () => await request("http://api.open-notify.org/astros.json"),
-    schema: {
-      description: "Get the number and name of people currently in space",
-      properties: {},
-      required: []
-    }
-  },
-  // Nominatin API: Reverse Geocoding
-  getCityByCoordinates: {
-    callback: async (lat, long) => await request(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${long}&format=json&zoom=10`),
-    schema: {
-      description: "Get the city, county, state and country by latitude and longitude coordinates",
-      properties: {
-        lat: { type: 'number' },
-        long: { type: 'number' }
-      },
-      required: ['lat', 'long']
-    }
-  },
-  // Tomorrow.io: Realtime weather data
-  getWeatherByCoordinates: {
-    callback: async (lat, long) => await request(`https://api.tomorrow.io/v4/weather/realtime?location=${lat},${long}&units=metric&apikey=${API_KEYS.TOMORROW_IO}`),
-    schema: {
-      description: "Get the temperature and weather code by latitude and longitude coordinates",
-      properties: {
-        lat: { type: 'number' },
-        long: { type: 'number' }
-      },
-      required: ['lat', 'long']
-    }
-  }
-};
-
-// precompile a schema validator for each public API function call
-const jsonValidator = new Ajv();
-Object.values(FUNCTION_CALLS).forEach(func => func.validate = jsonValidator.compile(func.schema));
-
 
 // Proxy Endpoints
 
@@ -237,18 +248,16 @@ app.post("/function/call", async (req, res) => {
         { role: "user", content: prompt }
       ])
       break;
-  case "noushermes2promistral":
-  case "mistral:7b-instruct":
+  case "hermes2promistral":
+  case "hermes2prollama3":
+  case "mistral:instruct":
     messages = await callOllama(model, [
       {
         role: "system",
-// TODO instruct the model to break down reasoning into separate function calls, one at a time. When one function call's arguments depend on the result from a previous call, there is no point
-// in requesting the second call with dynamic argument placeholders. The model should be instructed to make the second call after the first call has been resolved.
         content: `You are a function calling AI model. You are provided with function signatures within <tools></tools> XML tags. You may call one or more functions to assist with the user query. \
-Always make one function call at the time, and don't make assumptions about what values to plug into functions. Use the JSON schema specification for each tool call you will make: \
-{'title': 'arguments', 'type': 'object', 'properties': {'options': {'title': 'Options', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['options', 'name']}
-Here are the available tools:\n\
-<tools>\n${formatHermes2Functions()}\n</tools>\n\
+Break down your reasoning into separate step and perform only one function call per step. Don't make assumptions about the values you plug into functions. Here are the available tools:\n <tools>\n${JSON.stringify(formatTools())}\n</tools>\n\
+Use the pydantic model JSON schema for each tool call you will make: \
+{'title': 'FunctionCall', 'type': 'object', 'properties': {'arguments': {'title': 'Arguments', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['argument', 'name']} \
 For each function call return a JSON object with function name and arguments within <tool_call></tool_call> XML tags as follows:\n \
 <tool_call>\n \
 {"name": "FUNCTION_NAME", "arguments": "ARGS_DICT" }\n \
@@ -262,4 +271,20 @@ For each function call return a JSON object with function name and arguments wit
   res.json({ messages });
 });
 
-app.listen(8000, () => console.log(`\nServer running on http://localhost:8000\n\nOLLAMA endpoint: ${CONFIG.OLLAMA.ENDPOINT}`));
+
+// precompile a schema validator for each public API function call
+
+const jsonValidator = new Ajv();
+Object.values(FUNCTION_CALLS).forEach(f => {
+  const { description, properties, required } = f;
+  f.validate = jsonValidator.compile({ description, properties, required });
+});
+
+// Start the server
+
+app.listen(8000, () => {
+  console.log('available tools', JSON.stringify(formatTools()));
+  console.log('OLLAMA endpoint:', CONFIG.OLLAMA.ENDPOINT);
+  console.log('Server running on http://localhost:8000')
+});
+
